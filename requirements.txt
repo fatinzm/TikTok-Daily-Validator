@@ -1,0 +1,8 @@
+openai
+supabase
+moviepy
+yt-dlp
+python-dotenv
+undetected-chromedriver
+ffmpeg-python
+schedule
