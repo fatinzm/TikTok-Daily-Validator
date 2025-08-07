@@ -16,21 +16,30 @@ from supabase import create_client, Client
 from yt_dlp import YoutubeDL
 from pathlib import Path
 import numpy as np
+from datetime import datetime, timedelta
+from difflib import SequenceMatcher
+
 
 load_dotenv()
 
 APIFY_API_TOKEN = os.getenv("APIFY_API_TOKEN")
 APIFY_ACTOR_ID = "clockworks~free-tiktok-scraper"
 openai.api_key = os.getenv("OPENAI_API_KEY")
+SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 with open("hooks.json", "r", encoding="utf-8") as f:
-    hook_data = json.load(f)
+    HOOKS = json.load(f)
+    LONG_TEXT_HOOKS = HOOKS.get("long_text_hooks", [])
+    SHORT_TEXT_HOOKS = HOOKS.get("short_text_hooks", [])
 
-LONG_TEXT_HOOKS = hook_data["long_text_hooks"]
-SHORT_TEXT_HOOKS = hook_data["short_text_hooks"]
+def similar(a, b):
+    return SequenceMatcher(None, a, b).ratio()
+
+def fuzzy_match_hook(text, hook_list, threshold=0.75):
+    return next((hook for hook in hook_list if similar(hook.lower(), text.lower()) >= threshold), None)
 
 def fetch_videos_from_apify(username):
     input_payload = {
@@ -110,46 +119,39 @@ def extract_metadata(video_path):
     return duration, frames, face_presence
 
 def ask_gpt_and_find_hook(duration, frames):
-    extracted_texts = []
-    for frame in frames:
-        with open(frame, "rb") as f:
-            image_bytes = f.read()
-        encoded_image = base64.b64encode(image_bytes).decode("utf-8")
+    with open(frames[0], "rb") as f:
+        image_bytes = f.read()
+    encoded_image = base64.b64encode(image_bytes).decode("utf-8")
 
-        try:
-            response = openai.chat.completions.create(
-                model="gpt-4o",
-                messages=[{
+    try:
+        response = openai.chat.completions.create(
+            model="gpt-4o",
+            messages=[
+                {
                     "role": "user",
                     "content": [
                         {"type": "text", "text": (
-                            "Please extract all overlay or subtitle text from this video frame. "
-                            "Just return the visible words/text as plain text. No description or analysis."
+                            "Extract ONLY the overlay text shown in this image (likely from the first frame of a TikTok video). "
+                            "Return ONLY the short readable white or bold text shown directly on the video — DO NOT include captions, hashtags, emojis, or repeated text. "
+                            "Return a single clean line of text that appears visually overlaid on the video content."
                         )},
                         {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{encoded_image}"}}
                     ]
-                }],
-                temperature=0.2
-            )
-            extracted_texts.append(response.choices[0].message.content.strip())
-        except Exception:
-            extracted_texts.append("")
+                }
+            ],
+            temperature=0.2
+        )
+        clean_text = response.choices[0].message.content.strip()
+    except Exception:
+        clean_text = ""
 
-    # Join all frame results
-    joined_text = " ".join(extracted_texts).strip().lower()
+    # Try fuzzy matching against hook lists
+    lower_clean = clean_text.lower()
+    matched_short = next((hook for hook in SHORT_TEXT_HOOKS if difflib.SequenceMatcher(None, hook.lower(), lower_clean).ratio() >= 0.75), None)
+    matched_long = next((hook for hook in LONG_TEXT_HOOKS if difflib.SequenceMatcher(None, hook.lower(), lower_clean).ratio() >= 0.75), None)
 
-    # Try to match exactly
-    exact_short = any(h.lower() == joined_text for h in SHORT_TEXT_HOOKS)
-    exact_long = any(h.lower() == joined_text for h in LONG_TEXT_HOOKS)
+    return [clean_text], matched_short, matched_long, clean_text
 
-    # Try fuzzy match
-    fuzzy_short = difflib.get_close_matches(joined_text, [h.lower() for h in SHORT_TEXT_HOOKS], n=1, cutoff=0.8)
-    fuzzy_long = difflib.get_close_matches(joined_text, [h.lower() for h in LONG_TEXT_HOOKS], n=1, cutoff=0.8)
-
-    matched_short = exact_short or bool(fuzzy_short)
-    matched_long = exact_long or bool(fuzzy_long)
-
-    return extracted_texts, joined_text, matched_short, matched_long
 
 def store_result(username, url, duration, extracted_texts, joined_text, matched_short, matched_long, face_presence, upload_time):
     result = {
@@ -164,7 +166,7 @@ def store_result(username, url, duration, extracted_texts, joined_text, matched_
         "created_at": upload_time
     }
 
-    if 12 <= duration <= 18:
+    if 11 <= duration <= 19:
         result["validation_type"] = "Short Text + In-App Footage"
         face_ok = face_presence.get(3) and face_presence.get(4) and face_presence.get(5)
         passed = matched_short and face_ok
@@ -173,7 +175,7 @@ def store_result(username, url, duration, extracted_texts, joined_text, matched_
         if not face_ok: reason.append("face not detected at 3, 4, 5s")
         result["status"] = "pass" if passed else "fail"
         result["reason"] = ", ".join(reason)
-    elif 6 <= duration <= 9:
+    elif 5 <= duration <= 10:
         result["validation_type"] = "Long Text"
         passed = matched_long
         result["status"] = "pass" if passed else "fail"
@@ -183,6 +185,7 @@ def store_result(username, url, duration, extracted_texts, joined_text, matched_
         result["status"] = "fail"
         result["reason"] = "duration out of expected range"
     supabase.table("validated_videos").insert(result).execute()
+    return result
 
 def validate_tiktok_profile(username):
     print(f"Validating {username}...")
@@ -197,9 +200,32 @@ def validate_tiktok_profile(username):
         temp_path = Path(tempfile.mkdtemp()) / f"{username}.mp4"
         download_video(url, temp_path)
         duration, frames, face_presence = extract_metadata(temp_path)
-        extracted_texts, joined_text, matched_short, matched_long = ask_gpt_and_find_hook(duration, frames)
-        store_result(username, url, duration, extracted_texts, joined_text, matched_short, matched_long, face_presence, upload_time)
+        extracted_texts, matched_short, matched_long, clean_text = ask_gpt_and_find_hook(duration, frames)
+        result = store_result(username, url, duration, extracted_texts, clean_text, matched_short, matched_long, face_presence, upload_time)
+        send_slack_message(result)
         shutil.rmtree(temp_path.parent)
+
+def send_slack_message(data):
+    """Send a message to Slack with video validation result."""
+    if not SLACK_WEBHOOK_URL:
+        print("Slack webhook not set. Skipping Slack message.")
+        return
+
+    message = f"""
+*✅ Validated:* @{data['username']}
+📹 *Duration:* {data['duration']}s
+🔗 <{data['tiktok_url']}|View Video>
+📝 *Type:* {data['validation_type']}
+🎯 *Status:* {data['status'].upper()}
+📋 *Hook:* {data['hook_text']}
+❓ *Reason:* {data['reason']}
+🕒 *Posted:* {data['created_at']}
+"""
+    payload = {"text": message.strip()}
+    try:
+        requests.post(SLACK_WEBHOOK_URL, data=json.dumps(payload), headers={"Content-Type": "application/json"})
+    except Exception as e:
+        print(f"Slack error: {e}")
 
 
 def load_usernames(path="usernames.txt"):
