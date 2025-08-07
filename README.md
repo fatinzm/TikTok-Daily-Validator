@@ -1,6 +1,6 @@
 # 🕵️‍♀️ Daily TikTok Scraper & Validator
 
-This project automatically scrapes TikTok videos from specific profiles every 24 hours, downloads non-pinned posts uploaded in the last 24 hours, validates them using OpenAI GPT-4o, and stores the results in a Supabase database.
+This project automatically scrapes TikTok videos from specific profiles every 24 hours, downloads non-pinned posts uploaded in the last 24 hours, validates them using OpenAI GPT-4o, stores the results in a Supabase database, and send the results as a message to a Slack channel.
 
 ## 📦 Features
 
@@ -14,6 +14,7 @@ This project automatically scrapes TikTok videos from specific profiles every 24
   - **Short Text + In-App Footage** (12–18s, face at 3–5s, app footage, hook text)
   - **Long Text** (6–9s, fast background action, large readable text)
 - ✅ Store results in Supabase
+- ✅ Send results as a message in Slack
 - ✅ Clean up videos after processing
 - ✅ Schedule to run daily at a specified time
 
@@ -53,6 +54,7 @@ OPENAI_API_KEY=your-openai-key
 SUPABASE_URL=your-supabase-url
 SUPABASE_SERVICE_ROLE_KEY=your-supabase-service-role-key
 APIFY_API_TOKEN=your-apify-token
+SLACK_WEBHOOK_URL=your-slack-webhook-url
 ```
 
 ---
