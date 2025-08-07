@@ -109,4 +109,3 @@ Built using:
 ## 📬 Contact
 
 Made with ❤️ for Faircado.  
-Questions or issues? Ping @fati
